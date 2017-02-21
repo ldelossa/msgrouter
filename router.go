@@ -46,6 +46,12 @@ func (r *GenericRouter) Send(msg *interface{}) error {
 }
 
 func (r *GenericRouter) RegisterComponent(c *Component) error {
+  // Search for component, if exists return this
+	for _, ci := range r.registeredComponents {
+		if ci == c 
+	}
+
+
 	// Add component to registeredComponents
 	r.registeredComponents = append(r.registeredComponents, c)
 
