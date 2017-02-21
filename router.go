@@ -3,23 +3,23 @@ package msgrouter
 import "errors"
 
 type Router interface {
-	Send() error
-	RegisterComponent(*Component) error
-	UnregisterComponent(*Component) error
-	AddRoute() error
-	RemoveRoute() error
-	ListRoutes() error
+	Send(msg *interface{}) error
+	RegisterComponent(c *Component) error
+	UnregisterComponent(c *Component) error
+	AddRoute(src *Component, dst *Component) error
+	RemoveRoute(src *Component, dst *Component) error
+	ListRoutes() (string, error)
 }
 
 type GenericRouter struct {
-	inChan               <-chan interface{}
+	inChan               chan<- interface{}
 	rt                   *routingTable
 	registeredComponents []*Component
 }
 
-func NewGenericRouter() *GenericRouter {
+func NewGenericRouter(bufferSize int) *GenericRouter {
 	// Create inChan
-	c := make(chan interface{}, 15000)
+	c := make(chan interface{}, bufferSize)
 
 	// Create empty routing table
 	var rt *routingTable
@@ -34,8 +34,15 @@ func NewGenericRouter() *GenericRouter {
 
 }
 
-func (r *GenericRouter) Send() error {
-	return errors.New("Place Holder")
+func (r *GenericRouter) Send(msg *interface{}) error {
+
+	select {
+	case r.inChan <- msg:
+		return nil
+	default:
+		return errors.New("Could not send message to Router")
+	}
+
 }
 
 func (r *GenericRouter) RegisterComponent(c *Component) error {
@@ -59,7 +66,7 @@ func (r *GenericRouter) UnregisterComponent(c *Component) error {
 }
 
 func (r *GenericRouter) AddRoute() error {
-	return errors.New("Place Holder")
+
 }
 
 func (r *GenericRouter) RemoveRoute() error {
