@@ -18,10 +18,10 @@ type Router interface {
 }
 
 // componentID is an ID used to select registered components
-type componentID int
+type componentID UUID
 
 // Map which correlates source component to one or more destination components
-type routingTable map[Component][]Component
+type routingTable map[UUID][]Component
 
 // GenericRouter is an implementation of a router. External channels are for
 // API access while internal channels are for consuming off of.
@@ -35,7 +35,7 @@ type GenericRouter struct {
 	externalRegChan chan<- interface{}
 	internalRegChan <-chan interface{}
 	rt              routingTable
-	rc              []Component
+	rc              map[UUID]Component
 }
 
 // msg* structs are used to package messages that will be sent on the
@@ -67,8 +67,8 @@ func NewGenericRouter(bufferSize int) *GenericRouter {
 	// create routing table
 	rt := routingTable{}
 
-	// create registeredComponents array
-	rc := []Component{}
+	// create registeredComponents map
+	rc := make(map[UUID]Component)
 
 	// construct router - same channel is used for each type but struct
 	// defines unidirectionality of channel.
@@ -109,8 +109,39 @@ func (r *GenericRouter) send(m interface{}) error {
 
 }
 
+func (r *GenericRouter) register(c Component) (UUID, error) {
+	uuid, err := newUUID()
+	if err != nil {
+		return UUID(""), errors.New("Could not generate UUID")
+	}
+	c.SetID(uuid)
+	r.rc[uuid] = c
+	return uuid, nil
+}
+
 // RegisterComponent registers a Component object with the router. This then
 // allows us to use this component in route definitions
-func (r *GenericRouter) RegisterComponent(c Component) {
+func (r *GenericRouter) RegisterComponent(c Component) (UUID, error) {
+
+	// Check to see if component already has ID
+	id, err := c.GetID()
+	if err == nil {
+		// If found ID currently in r.rc, and struct matches, already registered return UUID
+		// If ID found and struct doesn't match, generate new ID and register struct
+		if comp, ok := r.rc[id]; ok {
+
+			if comp == c {
+				return id, nil
+			}
+
+			var uuid UUID
+			uuid, err = r.register(c)
+			return uuid, err
+		}
+	}
+
+	// Didn't come in with ID. Register and return hash
+	uuid, err := r.register(c)
+	return uuid, err
 
 }
