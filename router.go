@@ -1,6 +1,9 @@
 package msgrouter
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Router allows synchronization and routing decisions to be made between
 // go routines. By having go routines send to a router we can create different
@@ -9,49 +12,69 @@ import "errors"
 // external go routines thus synchronizing updates without the need for locks
 type Router interface {
 	Send(msg *interface{}) error
-	RegisterComponent(c Component) error
-	UnregisterComponent(c Component) error
-	AddRoute(src Component, dst Component) error
-	RemoveRoute(src Component, dst Component) error
-	ListRoutes() (string, error)
+	RegisterComponent(msgMsg) error
+	UnregisterComponent(msgMsg) error
+	AddRoute(msgRt) error
+	RemoveRoute(msgRt) error
+	// ListRoutes() (string, error)
 	Consume()
 }
 
-// componentID is an ID used to select registered components
-type componentID UUID
+// Operation constants to multiplex operations over channels
+
+//REGISTER is a op code for msgReg. Tells router to use registerComponent handler
+const REGISTER = 0
+
+// UNREGISTER is an op code for msgReg. Tells router to use unregisterComponent
+// handler
+const UNREGISTER = 1
+
+// ADDROUTE is an op code for msgRt. Tells router to use addRoute handler.
+const ADDROUTE = 0
+
+// REMOVEROUTE is an op code for msgRt. Tells router to use removeRoute handler.
+const REMOVEROUTE = 1
+
+// LISTROUTES is an op code for msgRt. Tells router to use listRoutes handler.
+const LISTROUTES = 2
+
+// ComponentID is an ID used to select registered components
+type ComponentID UUID
 
 // Map which correlates source component to one or more destination components
-type routingTable map[UUID][]Component
+type routingTable map[ComponentID][]Component
 
 // GenericRouter is an implementation of a router. External channels are for
 // API access while internal channels are for consuming off of.
 // TODO: make struct or interface to handle messages on each channel, removing
 // interface{}
 type GenericRouter struct {
-	externalMsgChan chan<- interface{}
-	internalMsgChan <-chan interface{}
-	externalRtChan  chan<- interface{}
-	internalRtChan  <-chan interface{}
-	externalRegChan chan<- interface{}
-	internalRegChan <-chan interface{}
+	externalMsgChan chan<- msgMsg
+	internalMsgChan <-chan msgMsg
+	externalRtChan  chan<- msgRt
+	internalRtChan  <-chan msgRt
+	externalRegChan chan<- msgReg
+	internalRegChan <-chan msgReg
 	rt              routingTable
-	rc              map[UUID]Component
+	rc              map[ComponentID]Component
 }
 
 // msg* structs are used to package messages that will be sent on the
 // associated channel. External API
 type msgMsg struct {
-	src     componentID
+	src     ComponentID
 	payload interface{}
 }
 
 type msgRt struct {
-	src  componentID
-	dest componentID
+	op   int
+	src  ComponentID
+	dest ComponentID
 }
 
 type msgReg struct {
-	c Component
+	c  Component
+	op int
 }
 
 // NewGenericRouter is a constructor for a generic implementation of a Router
@@ -60,15 +83,15 @@ type msgReg struct {
 func NewGenericRouter(bufferSize int) *GenericRouter {
 
 	// make channels
-	msgChan := make(chan interface{}, bufferSize)
-	rtChan := make(chan interface{}, bufferSize)
-	cmpChan := make(chan interface{}, bufferSize)
+	msgChan := make(chan msgMsg, bufferSize)
+	rtChan := make(chan msgRt, bufferSize)
+	cmpChan := make(chan msgReg, bufferSize)
 
 	// create routing table
 	rt := routingTable{}
 
 	// create registeredComponents map
-	rc := make(map[UUID]Component)
+	rc := make(map[ComponentID]Component)
 
 	// construct router - same channel is used for each type but struct
 	// defines unidirectionality of channel.
@@ -86,9 +109,37 @@ func NewGenericRouter(bufferSize int) *GenericRouter {
 	return r
 }
 
-// Send is an endpoint used for external go routines to send messages into the
-// router
-func (r *GenericRouter) Send(m interface{}) error {
+// Consume is meant to be ran as a go routine. Consume will listen on all
+// internal message channels and run the appropriate function handler based on the
+// message received.
+func (r *GenericRouter) Consume() {
+
+	select {
+	case m := <-r.internalMsgChan:
+		go r.send(m)
+	case m := <-r.internalRtChan:
+		switch {
+		case m.op == ADDROUTE:
+			r.addRoute(m)
+		case m.op == REMOVEROUTE:
+			r.removeRoute(m)
+		case m.op == LISTROUTES:
+			fmt.Println()
+		}
+	case m := <-r.internalRegChan:
+		switch {
+		case m.op == UNREGISTER:
+			r.unregisterComponent(m)
+		case m.op == REGISTER:
+			r.registerComponent(m)
+		}
+	}
+
+}
+
+// Send is a wrapper for external usage. Wrapping a send to the
+// external message channel of our router.
+func (r *GenericRouter) Send(m msgMsg) error {
 
 	select {
 	case r.externalMsgChan <- m:
@@ -99,49 +150,175 @@ func (r *GenericRouter) Send(m interface{}) error {
 
 }
 
-// internal send method for routing messages to correct destinations
-func (r *GenericRouter) send(m interface{}) error {
+func (r *GenericRouter) send(m msgMsg) {
 
-	//TODO: lookup source of sending message in routing table:
-	// handle source not being in routing table, router needs to log this
-	// if source is in routing table lookup associated []component array, cycles
-	// through destinations and call their Send() functions.
-
-}
-
-func (r *GenericRouter) register(c Component) (UUID, error) {
-	uuid, err := newUUID()
-	if err != nil {
-		return UUID(""), errors.New("Could not generate UUID")
+	// Confirm src in msgMsg is in component array
+	if _, ok := r.rc[m.src]; !ok {
+		return
 	}
-	c.SetID(uuid)
-	r.rc[uuid] = c
-	return uuid, nil
+
+	// Obtain routes
+	routesArray, ok := r.rt[m.src]
+	if !ok {
+		return
+	}
+
+	// Send payload to each route.
+	for _, comp := range routesArray {
+		comp.Send(m.payload)
+	}
+
 }
 
-// RegisterComponent registers a Component object with the router. This then
-// allows us to use this component in route definitions
-func (r *GenericRouter) RegisterComponent(c Component) (UUID, error) {
+// // internal send method for routing messages to correct destinations
+// func (r *GenericRouter) send(m interface{}) error {
+//
+// 	//TODO: lookup source of sending message in routing table:
+// 	// handle source not being in routing table, router needs to log this
+// 	// if source is in routing table lookup associated []component array, cycles
+// 	// through destinations and call their Send() functions.
+//
+// }
 
+// func (r *GenericRouter) register(c Component) (ComponentID, error) {
+// 	uuid, err := newUUID()
+// 	if err != nil {
+// 		return ComponentID(""), errors.New("Could not generate UUID")
+// 	}
+// 	c.SetID(uuid)
+// 	r.rc[uuid] = c
+// 	return uuid, nil
+// }
+
+// RegisterComponent is a wrapper for external usage. Wrapping a send to the
+// external registration channel of our router.
+func (r *GenericRouter) RegisterComponent(m msgReg) {
+	// Tag on operation constant
+	m.op = REGISTER
+	// Send msgReg to external msgChan
+	r.externalRegChan <- m
+
+}
+
+func (r GenericRouter) registerComponent(m msgReg) error {
 	// Check to see if component already has ID
-	id, err := c.GetID()
+	id, err := m.c.GetID()
 	if err == nil {
-		// If found ID currently in r.rc, and struct matches, already registered return UUID
-		// If ID found and struct doesn't match, generate new ID and register struct
+
+		// If component ID found, do lookup of ID in rc table.
 		if comp, ok := r.rc[id]; ok {
 
-			if comp == c {
-				return id, nil
+			// Lookup of id succeeded, and component being registered matches lookup,
+			// return hash, already registered.
+			if comp == m.c {
+				return nil
 			}
 
-			var uuid UUID
-			uuid, err = r.register(c)
-			return uuid, err
 		}
 	}
 
-	// Didn't come in with ID. Register and return hash
-	uuid, err := r.register(c)
-	return uuid, err
+	// This is a fallthrough. Didn't come in with ID or came in with ID but component
+	// didn't match. Register and setID on component.
+	uuid, err := newUUID()
+	if err != nil {
+		return errors.New("Could not generate UUID")
+	}
+	m.c.SetID(uuid)
+	r.rc[uuid] = m.c
+	return nil
+
+}
+
+// UnregisterComponent is a wrapper for external usage. Wrapping a send to the
+// external unregistration channel of our router.
+func (r *GenericRouter) UnregisterComponent(m msgReg) {
+	// Tag on operation constant
+	m.op = UNREGISTER
+	// send msgReg to external msgChan
+	r.externalRegChan <- m
+}
+
+// unregisterComponent searches the registeredComponent table for the hash
+// that's in msgReg.Component. It will remove the component from the rc.
+// This does not stop routing of registered components. Removing the route
+// is necessary. TODO: Block removal of component if route exists for the
+// component.
+func (r GenericRouter) unregisterComponent(m msgReg) error {
+	// Check to see if component has ID
+	id, err := m.c.GetID()
+	if err == nil {
+		// If component has hash, look up hash in rc. If lookup succeeds, delete
+		// the map entry
+		if _, ok := r.rc[id]; ok {
+			delete(r.rc, id)
+			return nil
+		}
+
+	}
+	return errors.New("Component not registered")
+}
+
+// AddRoute is a wrapper for external usage. Wrapping a send to the
+// external route channel of our router.
+func (r *GenericRouter) AddRoute(m msgRt) {
+	// Tag on operation constant
+	m.op = ADDROUTE
+	// send msgRt to external msgChan
+	r.externalRtChan <- m
+}
+
+// addRoute adds a component to an array of components. This array is hashed
+// on the componetID, associating a component with it's routes. Only components
+// registered by RegisterComponent are applicable for routes.
+func (r *GenericRouter) addRoute(m msgRt) {
+
+	// Confirm source is in registered components array
+	if _, ok := r.rc[m.src]; !ok {
+		return
+	}
+	if _, ok := r.rc[m.dest]; !ok {
+		return
+	}
+
+	srcArray := r.rt[m.src]
+
+	// Add destination component into source component's array. Lookup component
+	// in registered component array
+	srcArray = append(srcArray, r.rc[m.dest])
+
+}
+
+// RemoveRoute is a wrapper for external usage. Wrapping a send to the
+// external route channel of our router.
+func (r *GenericRouter) RemoveRoute(m msgRt) {
+	// Tag on operation constant
+	m.op = REMOVEROUTE
+	// Send msgRt to external msgChan
+	r.externalRtChan <- m
+}
+
+// removeRoute lookups a route's source, locates the given destination and
+// removes this destination from the route's component array.
+func (r *GenericRouter) removeRoute(m msgRt) {
+
+	// Confirm source is in registered components array
+	if _, ok := r.rc[m.src]; !ok {
+		return
+	}
+	if _, ok := r.rc[m.dest]; !ok {
+		return
+	}
+
+	// Lookup component array for source
+	srcArray := r.rt[m.src]
+
+	// Cycle through source array, remove destination component if found. Rrder
+	// not important so just swap to last and return len - 1
+	for i, c := range srcArray {
+		if r.rc[m.dest] == c {
+			srcArray[len(srcArray)-1], srcArray[i] = srcArray[i], srcArray[len(srcArray)-1]
+			srcArray = srcArray[:len(srcArray)-1]
+		}
+	}
 
 }
